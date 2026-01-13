@@ -1,0 +1,6 @@
+selenium
+webdriver-manager
+python-dotenv
+supabase
+requests
+beautifulsoup4
