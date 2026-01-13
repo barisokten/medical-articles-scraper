@@ -15,6 +15,9 @@ from selenium.webdriver.chrome.service import Service
 
 from supabase import create_client
 from dotenv import load_dotenv
+import re
+
+
 
 load_dotenv()
 
@@ -91,6 +94,39 @@ def is_valid_florence_article_url(url: str) -> bool:
     if path == "/guncel-saglik":
         return False
     return True
+# KEYWORD İŞLEMİ
+TR_STOPWORDS = {
+    "ve","ile","icin","için","da","de","ta","te","mi","mı","mu","mü",
+    "bir","bu","şu","o","en","cok","çok","gibi","nedir","nasil","nasıl","ne"
+}
+
+def keyword_from_title_or_slug(baslik: str | None, url: str) -> str:
+    # 1) Başlıktan üret
+    if baslik:
+        t = baslik.strip()
+        # "Başlık | Site" gibi son ekleri kırp
+        for sep in [" | ", " - ", " • ", " — ", " – "]:
+            if sep in t:
+                t = t.split(sep)[0].strip()
+                break
+        # temizle
+        t = t.lower()
+        t = re.sub(r"[^\w\sçğıöşü-]", " ", t, flags=re.UNICODE)
+        t = t.replace("-", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        words = [w for w in t.split() if w not in TR_STOPWORDS and len(w) > 2]
+        if words:
+            return " ".join(words[:4]).title()
+        return t.title() if t else "Genel"
+
+    # 2) URL slug fallback
+    path = (urlparse(url).path or "").rstrip("/")
+    slug = path.split("/")[-1] if path else ""
+    slug = slug.replace("-", " ").replace("_", " ").strip().lower()
+    slug = re.sub(r"[^\w\sçğıöşü]", " ", slug, flags=re.UNICODE)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    words = [w for w in slug.split() if w not in TR_STOPWORDS and len(w) > 2]
+    return (" ".join(words[:4]).title()) if words else (slug.title() if slug else "Genel")
 
 
 # -------------------------
@@ -317,6 +353,8 @@ class BlogScraper:
     def scrape_detail(self, site: str, url: str) -> tuple[str | None, str | None]:
         # 1) FAST
         title, date = self.scrape_detail_fast(site, url)
+        kw = keyword_from_title_or_slug(title, url)
+
         if title or date:
             return title, date
 
@@ -372,7 +410,8 @@ class BlogScraper:
             "site_adi": target["site"],
             "baslik": None,
             "url": u,
-            "yayin_tarihi": None
+            "yayin_tarihi": None,
+            "keyword": keyword_from_title_or_slug(None, u)   # ✅ links aşamasında slug’dan
         } for u in new_links]
 
         print(f"✅ DB’ye yazılacak yeni URL: {len(results)}")
@@ -406,7 +445,8 @@ class BlogScraper:
                 "site_adi": site_adi,
                 "url": url,
                 "baslik": title,
-                "yayin_tarihi": date
+                "yayin_tarihi": date,
+                "keyword": kw  # ✅ details aşamasında başlığa göre güncellenir
             })
             print(f"➡️ ({idx}/{len(rows)}) Detay alındı: {url}")
 
@@ -434,6 +474,30 @@ class BlogScraper:
         except Exception:
             pass
 
+def backfill_missing_keywords(site_adi: str, batch_limit: int = 200) -> int:
+    res = (
+        sb.table("articles")
+        .select("url,site_adi,baslik,keyword")
+        .eq("site_adi", site_adi)
+        .is_("keyword", "null")
+        .limit(batch_limit)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        print(f"✅ {site_adi}: keyword doldurulacak kayıt yok.")
+        return 0
+
+    updates = []
+    for r in rows:
+        url = r["url"]
+        baslik = r.get("baslik")
+        kw = keyword_from_title_or_slug(baslik, url)
+        updates.append({"site_adi": site_adi, "url": url, "keyword": kw})
+
+    sb.table("articles").upsert(updates, on_conflict="url").execute()
+    print(f"✅ {site_adi}: keyword güncellendi: {len(updates)}")
+    return len(updates)
 
 def run():
     targets = [
@@ -452,15 +516,23 @@ def run():
             if MODE in ("auto", "details"):
                 if not AUTO_DETAILS and MODE == "auto":
                     continue
+
                 # batch batch detay doldur
                 for _ in range(DETAIL_ROUNDS):
                     filled = scraper.fill_missing_details(t, batch_limit=DETAIL_BATCH_LIMIT)
                     if filled == 0:
                         break
 
+            # ✅ NEW: keyword backfill (title + url slug, GPT yok)
+            for _ in range(DETAIL_ROUNDS):
+                k = backfill_missing_keywords(t["site"], batch_limit=200)
+                if k == 0:
+                    break
+
     finally:
         print("\n⌛ Bitti. Tarayıcı kapanıyor...")
         scraper.close()
+
 
 
 if __name__ == "__main__":
