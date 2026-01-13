@@ -1,6 +1,8 @@
+# main.py
 import os
 import time
 import random
+import re
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -10,15 +12,17 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
+
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
 from supabase import create_client
 from dotenv import load_dotenv
-import re
 
 
-
+# -------------------------
+# BOOTSTRAP
+# -------------------------
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -29,16 +33,25 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ✅ FIX: Tek yerde config
-MODE = os.getenv("MODE", "auto").lower()               # auto | links | details
+# -------------------------
+# CONFIG
+# -------------------------
+MODE = os.getenv("MODE", "auto").lower()               # auto | links | details | keywords
 AUTO_DETAILS = os.getenv("AUTO_DETAILS", "1") == "1"   # auto modda details çalışsın mı
 DETAIL_BATCH_LIMIT = int(os.getenv("DETAIL_BATCH_LIMIT", "25"))
-DETAIL_ROUNDS = int(os.getenv("DETAIL_ROUNDS", "3"))  # tek run'da kaç batch
+DETAIL_ROUNDS = int(os.getenv("DETAIL_ROUNDS", "2"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "8"))
+CHUNK_IN_LIMIT = int(os.getenv("CHUNK_IN_LIMIT", "200"))
+HEADLESS = os.getenv("HEADLESS", "1") == "1"
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH")     # opsiyonel
+
+# Dentway: sadece blog mu?
+DENTWAY_ONLY_BLOG = os.getenv("DENTWAY_ONLY_BLOG", "0") == "1"
+
 
 # -------------------------
-# URL TEMİZLEME / FİLTRELER
+# URL HELPERS
 # -------------------------
-
 def normalize_url(url: str) -> str:
     """utm vb. query/fragment sil, normalize et."""
     try:
@@ -70,7 +83,12 @@ def is_valid_dentway_article_url(url: str) -> bool:
     if path == "/blog":
         return False
 
-    allowed_prefixes = ("/blog/", "/tedavi/")
+    # sadece blog istiyorsan /tedavi devre dışı
+    if DENTWAY_ONLY_BLOG:
+        allowed_prefixes = ("/blog/",)
+    else:
+        allowed_prefixes = ("/blog/", "/tedavi/")
+
     if not (path + "/").startswith(allowed_prefixes):
         return False
 
@@ -94,26 +112,31 @@ def is_valid_florence_article_url(url: str) -> bool:
     if path == "/guncel-saglik":
         return False
     return True
-# KEYWORD İŞLEMİ
+
+
+# -------------------------
+# KEYWORD
+# -------------------------
 TR_STOPWORDS = {
-    "ve","ile","icin","için","da","de","ta","te","mi","mı","mu","mü",
-    "bir","bu","şu","o","en","cok","çok","gibi","nedir","nasil","nasıl","ne"
+    "ve", "ile", "icin", "için", "da", "de", "ta", "te", "mi", "mı", "mu", "mü",
+    "bir", "bu", "şu", "o", "en", "cok", "çok", "gibi", "nedir", "nasil", "nasıl", "ne"
 }
+
 
 def keyword_from_title_or_slug(baslik: str | None, url: str) -> str:
     # 1) Başlıktan üret
     if baslik:
         t = baslik.strip()
-        # "Başlık | Site" gibi son ekleri kırp
         for sep in [" | ", " - ", " • ", " — ", " – "]:
             if sep in t:
                 t = t.split(sep)[0].strip()
                 break
-        # temizle
+
         t = t.lower()
         t = re.sub(r"[^\w\sçğıöşü-]", " ", t, flags=re.UNICODE)
         t = t.replace("-", " ")
         t = re.sub(r"\s+", " ", t).strip()
+
         words = [w for w in t.split() if w not in TR_STOPWORDS and len(w) > 2]
         if words:
             return " ".join(words[:4]).title()
@@ -125,6 +148,7 @@ def keyword_from_title_or_slug(baslik: str | None, url: str) -> str:
     slug = slug.replace("-", " ").replace("_", " ").strip().lower()
     slug = re.sub(r"[^\w\sçğıöşü]", " ", slug, flags=re.UNICODE)
     slug = re.sub(r"\s+", " ", slug).strip()
+
     words = [w for w in slug.split() if w not in TR_STOPWORDS and len(w) > 2]
     return (" ".join(words[:4]).title()) if words else (slug.title() if slug else "Genel")
 
@@ -132,7 +156,6 @@ def keyword_from_title_or_slug(baslik: str | None, url: str) -> str:
 # -------------------------
 # SCRAPER
 # -------------------------
-
 class BlogScraper:
     def __init__(self, headless: bool = True):
         opts = Options()
@@ -149,20 +172,21 @@ class BlogScraper:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
 
-        self.driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=opts
-        )
+        if CHROMEDRIVER_PATH and os.path.exists(CHROMEDRIVER_PATH):
+            service = Service(CHROMEDRIVER_PATH)
+        else:
+            service = Service(ChromeDriverManager().install())
+
+        self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, 15)
 
-        # ✅ HIZ: requests session
         self.http = requests.Session()
         self.http.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         })
 
-    def _wait_ready(self, timeout=15):
+    def _wait_ready(self, timeout=15) -> bool:
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -203,6 +227,7 @@ class BlogScraper:
         except Exception:
             pass
 
+    # ---------- LIST PAGES ----------
     def collect_links_basic(self, list_url: str, scroll_steps=6) -> list[str]:
         self.driver.get(list_url)
         self._wait_ready()
@@ -221,28 +246,6 @@ class BlogScraper:
                 pass
 
         return list(dict.fromkeys(hrefs))
-
-    def get_existing_urls(self, site_adi: str) -> set[str]:
-        existing = set()
-        start = 0
-        step = 1000
-        while True:
-            res = (
-                sb.table("articles")
-                .select("url")
-                .eq("site_adi", site_adi)
-                .range(start, start + step - 1)
-                .execute()
-            )
-            data = res.data or []
-            if not data:
-                break
-            for r in data:
-                u = r.get("url")
-                if u:
-                    existing.add(u)
-            start += step
-        return existing
 
     def collect_florence_article_links(self) -> list[str]:
         anchors = self.driver.find_elements(By.CSS_SELECTOR, "a[href]")
@@ -311,7 +314,7 @@ class BlogScraper:
 
     def _http_get_soup(self, url: str, timeout=12) -> BeautifulSoup | None:
         try:
-            time.sleep(random.uniform(0.10, 0.30))
+            time.sleep(random.uniform(0.10, 0.25))
             r = self.http.get(url, timeout=timeout)
             if r.status_code != 200:
                 return None
@@ -351,14 +354,10 @@ class BlogScraper:
         return None
 
     def scrape_detail(self, site: str, url: str) -> tuple[str | None, str | None]:
-        # 1) FAST
         title, date = self.scrape_detail_fast(site, url)
-        kw = keyword_from_title_or_slug(title, url)
-
         if title or date:
             return title, date
 
-        # 2) FALLBACK
         try:
             self.driver.get(url)
             self._wait_ready()
@@ -381,28 +380,58 @@ class BlogScraper:
         except Exception:
             return None, None
 
+    # ---------- DB HELPERS ----------
+    def get_existing_urls_for_candidates(self, site_adi: str, candidate_urls: list[str]) -> set[str]:
+        existing = set()
+        if not candidate_urls:
+            return existing
+
+        for i in range(0, len(candidate_urls), CHUNK_IN_LIMIT):
+            chunk = candidate_urls[i:i + CHUNK_IN_LIMIT]
+            try:
+                res = (
+                    sb.table("articles")
+                    .select("url")
+                    .eq("site_adi", site_adi)
+                    .in_("url", chunk)
+                    .execute()
+                )
+                for r in (res.data or []):
+                    u = r.get("url")
+                    if u:
+                        existing.add(u)
+            except Exception:
+                print(f"⚠️ DB in_ chunk sorgusu hata verdi (site={site_adi}, chunk={i}//{len(candidate_urls)})")
+
+        return existing
+
     # ---------- LINKS ONLY ----------
     def scrape_site_links_only(self, target: dict) -> list[dict]:
         print(f"\n🔍 {target['site']} -> {target['list_url']}")
-        all_links = self.collect_links_with_pagination(target, max_pages=8)
+        all_links = self.collect_links_with_pagination(target, max_pages=MAX_PAGES)
         print(f"🔗 Toplanan toplam link: {len(all_links)}")
 
-        # ✅ FIX: Önce filtrele, sonra DB kıyasla (loglar doğru olsun)
         candidate = []
         for url in all_links:
             if not same_domain(url, target["domain"]):
                 continue
+
             if target["site"] == "Dentway":
                 if not is_valid_dentway_article_url(url):
                     continue
             elif target["site"] == "Florence":
                 if not is_valid_florence_article_url(url):
                     continue
+
             candidate.append(url)
 
         candidate = list(dict.fromkeys(candidate))
+        print(f"🧹 Filtre sonrası aday link: {len(candidate)}")
 
-        existing = self.get_existing_urls(target["site"])
+        t0 = time.time()
+        existing = self.get_existing_urls_for_candidates(target["site"], candidate)
+        print(f"⏱️ DB var-yok kontrol süresi: {time.time() - t0:.2f}s")
+
         new_links = [u for u in candidate if u not in existing]
         print(f"🧠 DB’de var: {len(existing)} | 🆕 Yeni makale: {len(new_links)}")
 
@@ -411,47 +440,59 @@ class BlogScraper:
             "baslik": None,
             "url": u,
             "yayin_tarihi": None,
-            "keyword": keyword_from_title_or_slug(None, u)   # ✅ links aşamasında slug’dan
+            "keyword": keyword_from_title_or_slug(None, u),
+            "detail_checked": False,  # ✅ yeni kayıt -> detay denenmemiş
         } for u in new_links]
 
         print(f"✅ DB’ye yazılacak yeni URL: {len(results)}")
         return results
 
-    # ✅ FIX: parametre uyumu + return count
+    # ✅ GEREKSİZ TEKRAR YOK:
+    # sadece detail_checked=false olanları dene, sonra true yap.
     def fill_missing_details(self, target: dict, batch_limit: int = 25) -> int:
         site_adi = target["site"]
 
         res = (
             sb.table("articles")
-            .select("url,site_adi")
+            .select("url,site_adi,baslik,yayin_tarihi,detail_checked")
             .eq("site_adi", site_adi)
-            .is_("baslik", "null")
+            .eq("detail_checked", False)
             .limit(batch_limit)
             .execute()
         )
         rows = res.data or []
         if not rows:
-            print(f"✅ {site_adi}: doldurulacak boş kayıt yok.")
+            print(f"✅ {site_adi}: detay denenecek kayıt yok (detail_checked=false yok).")
             return 0
 
-        print(f"🛠️ {site_adi}: detay doldurulacak kayıt: {len(rows)} (batch={batch_limit})")
+        print(f"🛠️ {site_adi}: detay denenecek kayıt: {len(rows)} (batch={batch_limit})")
 
         updates = []
         for idx, r in enumerate(rows, start=1):
             url = r["url"]
+            old_title = r.get("baslik")
+            old_date = r.get("yayin_tarihi")
+
             title, date = self.scrape_detail(site_adi, url)
+
+            # tarih varsa yaz, yoksa NULL/eskisi kalsın
+            final_title = title if title else old_title
+            final_date = date if date else old_date
+
+            kw = keyword_from_title_or_slug(final_title, url)
 
             updates.append({
                 "site_adi": site_adi,
                 "url": url,
-                "baslik": title,
-                "yayin_tarihi": date,
-                "keyword": kw  # ✅ details aşamasında başlığa göre güncellenir
+                "baslik": final_title,
+                "yayin_tarihi": final_date,
+                "keyword": kw,
+                "detail_checked": True,   # ✅ denendi -> bir daha deneme
             })
-            print(f"➡️ ({idx}/{len(rows)}) Detay alındı: {url}")
+            print(f"➡️ ({idx}/{len(rows)}) Detay denendi: {url}")
 
         sb.table("articles").upsert(updates, on_conflict="url").execute()
-        print(f"✅ {site_adi}: detaylar güncellendi: {len(updates)}")
+        print(f"✅ {site_adi}: detay güncellendi (denendi): {len(updates)}")
         return len(updates)
 
     def save_to_supabase(self, rows: list[dict]):
@@ -473,6 +514,7 @@ class BlogScraper:
             self.driver.quit()
         except Exception:
             pass
+
 
 def backfill_missing_keywords(site_adi: str, batch_limit: int = 200) -> int:
     res = (
@@ -499,40 +541,43 @@ def backfill_missing_keywords(site_adi: str, batch_limit: int = 200) -> int:
     print(f"✅ {site_adi}: keyword güncellendi: {len(updates)}")
     return len(updates)
 
+
 def run():
     targets = [
         {"site": "Dentway", "domain": "dentway.com.tr", "list_url": "https://www.dentway.com.tr/blog/"},
         {"site": "Florence", "domain": "florence.com.tr", "list_url": "https://www.florence.com.tr/guncel-saglik"},
     ]
 
-    scraper = BlogScraper(headless=True)
+    scraper = BlogScraper(headless=HEADLESS)
 
     try:
         for t in targets:
+            # MODE=keywords -> sadece keyword işi
+            if MODE == "keywords":
+                for _ in range(DETAIL_ROUNDS):
+                    k = backfill_missing_keywords(t["site"], batch_limit=200)
+                    if k == 0:
+                        break
+                continue
+
+            # links
             if MODE in ("auto", "links"):
                 rows = scraper.scrape_site_links_only(t)
                 scraper.save_to_supabase(rows)
 
+            # details
             if MODE in ("auto", "details"):
-                if not AUTO_DETAILS and MODE == "auto":
+                if MODE == "auto" and not AUTO_DETAILS:
                     continue
 
-                # batch batch detay doldur
                 for _ in range(DETAIL_ROUNDS):
                     filled = scraper.fill_missing_details(t, batch_limit=DETAIL_BATCH_LIMIT)
                     if filled == 0:
                         break
 
-            # ✅ NEW: keyword backfill (title + url slug, GPT yok)
-            for _ in range(DETAIL_ROUNDS):
-                k = backfill_missing_keywords(t["site"], batch_limit=200)
-                if k == 0:
-                    break
-
     finally:
         print("\n⌛ Bitti. Tarayıcı kapanıyor...")
         scraper.close()
-
 
 
 if __name__ == "__main__":
