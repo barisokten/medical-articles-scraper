@@ -18,6 +18,18 @@ from selenium.webdriver.chrome.service import Service
 
 from supabase import create_client
 from dotenv import load_dotenv
+from datetime import datetime,timezone
+from urllib.parse import urlparse
+
+
+datetime.now(timezone.utc).isoformat()
+
+# ========= LINKIFY DOMAIN MAP =========
+DOMAIN_MAP = {
+    "ClinicWise": "clinic-wise.com",
+    "Florence": "www.florence.com.tr",
+    "Dentway": "www.dentway.com.tr",
+}
 
 
 # -------------------------
@@ -114,6 +126,59 @@ def is_valid_florence_article_url(url: str) -> bool:
     return True
 
 
+def is_valid_clinicwise_article_url(url: str) -> bool:
+    bad = [
+        "whatsapp.com", "goo.gl/maps", "tel:", "mailto:",
+        "facebook.com", "instagram.com"
+    ]
+    if any(x in url for x in bad):
+        return False
+
+    if not same_domain(url, "clinic-wise.com"):
+        return False
+
+    path = (urlparse(url).path or "").rstrip("/")
+
+    # boş, ana sayfa, blog listesi
+    if path in ("", "/", "/blog"):
+        return False
+
+    # ❌ BLOG OLMAYAN KESİN SAYFALAR
+    blocked_exact = {
+        "/about",
+        "/contact",
+        "/privacy-policy",
+        "/patient-stories",
+        "/patient-journey-guide",
+        "/medical-library",
+        "/become-a-partner",
+        "/become-an-influencer",
+        "/before-after-photos-in-turkey",
+        "/start-your-treatment-plan-easily",
+    }
+    if path in blocked_exact:
+        return False
+
+    # ❌ kategori / sayfalama / wp içeriği
+    blocked_prefixes = (
+        "/blog/page/",
+        "/category/",
+        "/tag/",
+        "/author/",
+        "/wp-json/",
+        "/wp-content/",
+        "/wp-admin/",
+    )
+    if any((path + "/").startswith(bp) for bp in blocked_prefixes):
+        return False
+
+    # ✅ URL uzunluğu: landing page’leri elemek için
+    if len(path) < 25:
+        return False
+
+    return True
+
+
 # -------------------------
 # KEYWORD
 # -------------------------
@@ -152,6 +217,36 @@ def keyword_from_title_or_slug(baslik: str | None, url: str) -> str:
     words = [w for w in slug.split() if w not in TR_STOPWORDS and len(w) > 2]
     return (" ".join(words[:4]).title()) if words else (slug.title() if slug else "Genel")
 
+
+def build_linkify_payload(row: dict) -> dict | None:
+    """
+    Scraper DB kaydını alır
+    linkify_with_images endpointine %100 uyumlu payload üretir
+    """
+
+    # 1️⃣ ZORUNLU: TEXT
+    text = (row.get("icerik") or row.get("content") or "").strip()
+    if len(text) < 200:
+        return None
+
+    # 2️⃣ DOMAIN
+    site = row.get("site_adi")
+    domain = DOMAIN_MAP.get(site)
+    if not domain:
+        return None
+
+    # 3️⃣ TOPIC
+    topic = (
+        row.get("baslik")
+        or row.get("keyword")
+        or text.split(".")[0][:120]
+    )
+
+    return {
+        "text": text,
+        "topic": topic.strip(),
+        "domain": domain,
+    }
 
 # -------------------------
 # SCRAPER
@@ -261,23 +356,78 @@ class BlogScraper:
                 if path != "/guncel-saglik":
                     out.append(href)
         return list(dict.fromkeys(out))
+    def collect_clinicwise_blog_links(self, scroll_steps=10):
+        self._smart_scroll(steps=scroll_steps, pause=0.7)
 
+        selectors = [
+            "article a[href]",
+            ".elementor-post a[href]",
+            ".elementor-post__title a[href]",
+            ".post a[href]",
+            ".post-card a[href]",
+            ".blog a[href]",
+            ".entry-title a[href]",
+        ]
+
+        hrefs = []
+        for sel in selectors:
+            try:
+                anchors = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for a in anchors:
+                    try:
+                        href = a.get_attribute("href")
+                        if href:
+                            hrefs.append(normalize_url(href))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # fallback: hiçbir şey yakalayamazsak tüm linkleri al ama filtrele
+        if not hrefs:
+            anchors = self.driver.find_elements(By.CSS_SELECTOR, "a[href]")
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href")
+                    if href:
+                        hrefs.append(normalize_url(href))
+                except Exception:
+                    pass
+
+        out = []
+        for u in hrefs:
+            if is_valid_clinicwise_article_url(u):
+                out.append(u)
+
+        return list(dict.fromkeys(out))
     def collect_links_with_pagination(self, target: dict, max_pages=8) -> list[str]:
         site = target["site"]
         list_url = target["list_url"]
         all_links = []
 
+        # ---------------- Dentway ----------------
         if site == "Dentway":
             for i in range(1, max_pages + 1):
                 page_url = list_url if i == 1 else list_url.rstrip("/") + f"/page/{i}/"
                 links = self.collect_links_basic(page_url, scroll_steps=5)
+
                 before = len(all_links)
                 all_links.extend(links)
                 all_links = list(dict.fromkeys(all_links))
+
                 print(f"   📄 Sayfa {i}: +{len(all_links) - before} yeni link")
                 if len(all_links) - before == 0 and i > 1:
                     break
 
+        # ---------------- ClinicWise ----------------
+        elif site == "ClinicWise":
+            self.driver.get(list_url)
+            self._wait_ready()
+            time.sleep(0.6)
+            self._try_accept_cookies()
+            all_links = self.collect_clinicwise_blog_links(scroll_steps=12)
+
+        # ---------------- Florence ----------------
         elif site == "Florence":
             seed_pages = [
                 "https://www.florence.com.tr/",
@@ -285,6 +435,8 @@ class BlogScraper:
                 "https://www.florence.com.tr/iletisim",
                 "https://www.florence.com.tr/insan-kaynaklari",
             ]
+
+            # 🔹 Normal Florence sayfaları
             for seed in seed_pages:
                 print(f"   🌱 Florence seed: {seed}")
                 self.driver.get(seed)
@@ -296,11 +448,144 @@ class BlogScraper:
                 links = self.collect_florence_article_links()
                 all_links.extend(links)
                 all_links = list(dict.fromkeys(all_links))
+
                 print(f"      +{len(all_links) - before} makale linki")
+
+            # 🔹 Florence Life (INFINITE SCROLL – TEK DOĞRU YÖNTEM)
+            print("   🌱 Florence Life infinite scroll")
+            life_links = self.collect_florence_life_links_scroll()
+            before = len(all_links)
+
+            all_links.extend(life_links)
+            all_links = list(dict.fromkeys(all_links))
+
+            print(f"      +{len(all_links) - before} Florence Life makale linki")
+
+        # ---------------- Default ----------------
         else:
             all_links = self.collect_links_basic(list_url, scroll_steps=6)
 
         return all_links
+    
+    def collect_florence_life_links_scroll(self, max_rounds=15) -> list[str]:
+        url = "https://www.florence.com.tr/florence-life"
+        self.driver.get(url)
+        self._wait_ready()
+        time.sleep(1)
+        self._try_accept_cookies()
+
+        all_links = set()
+        stable_rounds = 0
+        last_count = 0
+
+        for i in range(max_rounds):
+            # 🔽 scroll tetikleyici
+            self.driver.execute_script(
+                "window.scrollBy(0, window.innerHeight * 1.8);"
+            )
+            time.sleep(1.5)
+
+            links = self.collect_florence_article_links()
+            for l in links:
+                all_links.add(l)
+
+            print(f"      🔁 Scroll {i + 1}: toplam {len(all_links)}")
+
+            if len(all_links) == last_count:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+
+            last_count = len(all_links)
+
+            if stable_rounds >= 3:
+                print("      ⛔ Florence Life: yeni içerik yok")
+                break
+
+        return list(all_links)
+
+
+        # # elif site == "Florence":
+        # #     seed_pages = [
+        # #         "https://www.florence.com.tr/",
+        # #         "https://www.florence.com.tr/guncel-saglik",
+        # #         "https://www.florence.com.tr/iletisim",
+        # #         "https://www.florence.com.tr/insan-kaynaklari",
+        # #     ]
+
+        # #     # 🔹 Normal seed sayfaları
+        # #     for seed in seed_pages:
+        # #         print(f"   🌱 Florence seed: {seed}")
+        # #         self.driver.get(seed)
+        # #         self._wait_ready()
+        # #         time.sleep(0.6)
+        # #         self._try_accept_cookies()
+
+        # #         before = len(all_links)
+        # #         links = self.collect_florence_article_links()
+        # #         all_links.extend(links)
+        # #         all_links = list(dict.fromkeys(all_links))
+        # #         print(f"      +{len(all_links) - before} makale linki")
+
+            # # 🔹 Florence Life pagination (ASIL EKSİK OLAN KISIM)
+            # for page in range(1, max_pages + 1):
+            #     page_url = f"https://www.florence.com.tr/florence-life?page={page}"
+            #     print(f"   🌱 Florence Life page: {page_url}")
+
+            #     self.driver.get(page_url)
+            #     self._wait_ready()
+            #     time.sleep(0.6)
+            #     self._try_accept_cookies()
+
+            #       # 🔽 JS render edilen kartlar için scroll
+            #     for _ in range(4):
+            #         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            #         time.sleep(0.7)
+
+            #     before = len(all_links)
+            #     links = self.collect_florence_article_links()
+            #     all_links.extend(links)
+            #     all_links = list(dict.fromkeys(all_links))
+
+            #     added = len(all_links) - before
+            #     print(f"      +{added} makale linki")
+
+            #     if added == 0 and page > 1:
+            #         break
+
+            # 🔹 Florence Life – INFINITE SCROLL (KALICI ÇÖZÜM)
+            # print("   🌱 Florence Life infinite scroll")
+            # self.driver.get("https://www.florence.com.tr/florence-life")
+            # self._wait_ready()
+            # time.sleep(1)
+            # self._try_accept_cookies()
+
+            # stable_rounds = 0
+            # max_stable_rounds = 3
+
+            # while True:
+            #     self.driver.execute_script(
+            #         "window.scrollBy(0, window.innerHeight * 2);"
+            #     )
+            #     time.sleep(1.2)
+
+            #     before = len(all_links)
+            #     links = self.collect_florence_article_links()
+            #     all_links.extend(links)
+            #     all_links = list(dict.fromkeys(all_links))
+
+            #     added = len(all_links) - before
+            #     print(f"      +{added} Florence Life makale linki")
+
+            #     if added == 0:
+            #         stable_rounds += 1
+            #     else:
+            #         stable_rounds = 0
+
+            #     if stable_rounds >= max_stable_rounds:
+            #         print("   ⛔ Florence Life: yeni içerik yok, duruldu")
+            #         break
+           
 
     # ---------- FAST HTML PARSE ----------
     def _pick_first_text(self, soup: BeautifulSoup, selectors: list[str]) -> str | None:
@@ -337,9 +622,27 @@ class BlogScraper:
             date = self._pick_first_text(soup, ["time", ".date", ".publish-date", "article time"])
             return title, date
 
+        if site == "ClinicWise":
+            title = self._pick_first_text(
+                soup,
+                ["article h1", ".blog-title", "h1"]
+            )
+
+            # ❌ title yoksa veya çok kısa ise → içerik değildir
+            if not title or len(title) < 10:
+                return None, None
+
+            date = self._pick_first_text(
+                soup,
+                ["time", ".post-date", ".published-date"]
+            )
+            return title, date   # 🔥 EN ÖNEMLİ SATIR
+
+        # fallback (diğer siteler için)
         title = self._pick_first_text(soup, ["h1", "article h1"])
         date = self._pick_first_text(soup, ["time", ".date"])
         return title, date
+
 
     # ---------- SELENIUM FALLBACK ----------
     def _safe_text(self, css_list: list[str]) -> str | None:
@@ -422,6 +725,10 @@ class BlogScraper:
             elif target["site"] == "Florence":
                 if not is_valid_florence_article_url(url):
                     continue
+            elif target["site"] == "ClinicWise":
+                if not is_valid_clinicwise_article_url(url):
+                    continue
+
 
             candidate.append(url)
 
@@ -441,9 +748,11 @@ class BlogScraper:
             "url": u,
             "yayin_tarihi": None,
             "keyword": keyword_from_title_or_slug(None, u),
-            "detail_checked": False,  # ✅ yeni kayıt -> detay denenmemiş
-        } for u in new_links]
+            "detail_checked": False,  # ✅ yeni kayıt -> detay denenmemiş,
+            "updated_at": datetime.utcnow().isoformat(),
 
+        } for u in new_links]
+        
         print(f"✅ DB’ye yazılacak yeni URL: {len(results)}")
         return results
 
@@ -487,7 +796,9 @@ class BlogScraper:
                 "baslik": final_title,
                 "yayin_tarihi": final_date,
                 "keyword": kw,
-                "detail_checked": True,   # ✅ denendi -> bir daha deneme
+                "detail_checked": True,   # ✅ denendi -> bir daha deneme,
+                "updated_at": datetime.utcnow().isoformat(),
+
             })
             print(f"➡️ ({idx}/{len(rows)}) Detay denendi: {url}")
 
@@ -535,7 +846,14 @@ def backfill_missing_keywords(site_adi: str, batch_limit: int = 200) -> int:
         url = r["url"]
         baslik = r.get("baslik")
         kw = keyword_from_title_or_slug(baslik, url)
-        updates.append({"site_adi": site_adi, "url": url, "keyword": kw})
+       # updates.append({"site_adi": site_adi, "url": url, "keyword": kw})
+        updates.append({
+            "site_adi": site_adi,
+            "url": url,
+            "keyword": kw,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
 
     sb.table("articles").upsert(updates, on_conflict="url").execute()
     print(f"✅ {site_adi}: keyword güncellendi: {len(updates)}")
@@ -546,6 +864,7 @@ def run():
     targets = [
         {"site": "Dentway", "domain": "dentway.com.tr", "list_url": "https://www.dentway.com.tr/blog/"},
         {"site": "Florence", "domain": "florence.com.tr", "list_url": "https://www.florence.com.tr/guncel-saglik"},
+        {"site": "ClinicWise", "domain": "clinic-wise.com", "list_url": "https://clinic-wise.com/blog/"}
     ]
 
     scraper = BlogScraper(headless=HEADLESS)
